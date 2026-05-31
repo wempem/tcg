@@ -2,7 +2,7 @@
 
 Live trading-card identifier that runs **entirely in the browser** — no server, no cloud. Point your camera at an MTG / Pokemon / Yugioh card and watch the pipeline detect, classify, OCR, and match it against ~150,000 known cards.
 
-[**Live demo →**](https://wempem.github.io/card-browser-demo/) *(takes ~30s to download the model bundle on first load)*
+[**Live demo →**](https://wempem.github.io/tcg/) *(takes ~30s to download the model bundle on first load)*
 
 ![pipeline overview](./docs/pipeline-overview.png) <!-- optional; add later -->
 

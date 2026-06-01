@@ -117,10 +117,13 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       drawBox(ctx, d);
       if (!topDetection || d.conf > topDetection.conf) topDetection = d;
     }
-    if (!topDetection || !(topDetection.name || topDetection.collectorId)) {
+    if (!topDetection) {
       renderEmpty();
       return;
     }
+    // Surface the detection even when OCR is empty — this way you can see
+    // "card detected, template predicted, just OCR didn't read anything"
+    // rather than the silent "Hold a card…" state.
     updateMatches(topDetection);
   }
 

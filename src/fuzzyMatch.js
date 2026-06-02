@@ -22,10 +22,13 @@ const MTG_BASIC_LANDS = new Set([
 const TCG_WEIGHTS = {
   mtg: {
     name_hi: 0.7, name_lo: 0.3,
-    // symbol classifier is unreliable on in-the-wild camera crops — keep the
-    // bonus for confidently-correct hits, but raise the threshold and lower
-    // the penalty so a confidently-wrong prediction barely hurts.
-    symbol_bonus: 15, symbol_penalty: 3, symbol_penalty_conf: 0.95,
+    // The symbol is now sharpness-gated + locked before it's trusted, so it's
+    // a reliable SET id — and among printings of the same card (identical name
+    // score) it's the decisive tiebreaker. Weight it heavily. The conf scaling
+    // is softened (0.5 + 0.5*conf, see below) so a correct-but-moderate-conf
+    // hit (e.g. 0.45) still counts. Penalty stays gated at very high conf so a
+    // confidently-wrong symbol barely hurts.
+    symbol_bonus: 30, symbol_penalty: 3, symbol_penalty_conf: 0.95,
     set_text_bonus: 12, set_text_penalty: 8,
     border_bonus: 15,
     family_bonus: 3,
@@ -89,7 +92,7 @@ export function fuzzyMatch({
   if ((tcg === "mtg" || tcg === "pokemon") && indexData.by_set) {
     const signalled = new Set();
     if (ocrSetText) signalled.add(normalize(ocrSetText));
-    if (predictedSet && predictedSetConf >= 0.5) signalled.add(predictedSet);
+    if (predictedSet && predictedSetConf >= 0.4) signalled.add(predictedSet);
     for (const code of signalled) {
       const ids = indexData.by_set[code];
       if (ids) for (const i of ids) pool.add(i);
@@ -122,7 +125,9 @@ export function fuzzyMatch({
 
     if (predictedSet && e.set) {
       if (e.set === predictedSet) {
-        combined += w.symbol_bonus * predictedSetConf * setMult;
+        // Soften the conf discount: a correct symbol at 0.45 conf still earns
+        // ~0.72 of the bonus, not 0.45 — it's a real signal, not noise.
+        combined += w.symbol_bonus * (0.5 + 0.5 * predictedSetConf) * setMult;
       } else if (predictedSetConf >= w.symbol_penalty_conf) {
         combined -= w.symbol_penalty * predictedSetConf;
       }

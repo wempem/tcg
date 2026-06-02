@@ -58,18 +58,20 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   const loCanvas = document.createElement("canvas");
   const regionCanvas = document.createElement("canvas");
   const frameScratch = document.createElement("canvas");  // hosts the full-res frame
-  const focusCanvas = document.createElement("canvas");   // tiny gray card crop for sharpness
-
-  // Sharpness + stability gate. OCR only reads cleanly on sharp, settled
-  // frames (the model nails sharp crops but emits garbage on motion blur),
-  // so we run Stage B only when the card is in focus AND not moving, and
-  // latch the last good reading rather than re-OCR every blurry frame.
-  const FOCUS_MIN = 55;     // variance-of-Laplacian threshold (tunable; logged)
-  const STABLE_IOU = 0.9;   // bbox overlap vs previous frame == "not moving"
-  const LATCH_IOU = 0.5;    // overlap to treat a detection as the same card
-  let lastBox = null;       // previous frame's bbox (full-res coords)
-  let latched = null;       // currently displayed detection (frozen until card changes)
-  let uiState = "empty";    // 'empty' | 'focusing' | 'matched' — only redraw on change
+  // Per-signal locking. A single sharp frame is enough for the name, but the
+  // id/symbol may still be soft on that frame — so we do NOT latch all signals
+  // at once. Instead each region accumulates independently: it's read whenever
+  // ITS OWN crop is sharp, and locked once the read is trustworthy (OCR: the
+  // same text from two sharp crops; symbol: classifier confidence). Unlocked
+  // signals keep trying while locked ones stay frozen. Scoped to the card.
+  const REGION_FOCUS_MIN = 40;  // per-region variance-of-Laplacian to trust a read (tunable)
+  const OCR_AGREE = 2;          // identical sharp OCR reads needed to lock a text signal
+  const SYMBOL_LOCK = 0.6;      // symbol classifier softmax needed to lock the symbol
+  const STABLE_IOU = 0.85;      // bbox overlap vs previous frame == "not moving"
+  const LATCH_IOU = 0.5;        // overlap to treat a detection as the same card
+  let lastBox = null;           // previous frame's bbox (movement check)
+  let track = null;             // per-card signal accumulator (see freshTrack)
+  let lastRenderKey = "";       // dedupe panel re-renders (keeps the UI static)
   let frameNo = 0;
 
   // The YOLO box runs loose AROUND the card (margin on every side), not just
@@ -142,62 +144,107 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       if (!top || d.conf > top.conf) top = d;
     }
     if (!top) {
-      lastBox = null; latched = null;
-      if (uiState !== "empty") { renderEmpty(); uiState = "empty"; }
+      lastBox = null; track = null;
+      if (lastRenderKey !== "") { renderEmpty(); lastRenderKey = ""; }
       return;
     }
 
-    // Already locked onto this same card? Keep the frozen result — no re-OCR,
-    // no re-render. This is what makes the panel static instead of flickering.
-    if (latched && iou(top, latched) >= LATCH_IOU) {
-      lastBox = { x: top.x, y: top.y, w: top.w, h: top.h };
-      return;
+    // Same card as the running accumulator, or a new one?
+    if (!track || iou(top, track.box) < LATCH_IOU) {
+      track = freshTrack(top);
+    } else {
+      track.box = { x: top.x, y: top.y, w: top.w, h: top.h };
+      track.borderId = top.borderId;
+      // Keep the highest-confidence template we've seen for this card.
+      if (top.templateConf > track.templateConf) {
+        track.templateId = top.templateId;
+        track.templateConf = top.templateConf;
+      }
     }
 
-    // New / not-yet-read card: gate Stage B on focus + stability.
-    const focus = focusScore(top);
+    // Only accumulate when the card isn't moving (motion blurs every region).
     const stable = lastBox ? iou(top, lastBox) >= STABLE_IOU : false;
     lastBox = { x: top.x, y: top.y, w: top.w, h: top.h };
-    if ((++frameNo) % 30 === 0) {
-      console.log(`[gate] focus=${focus.toFixed(0)} (min ${FOCUS_MIN}) stable=${stable}`);
-    }
+    if (stable && track.templateId >= 0) accumulate(track);
 
-    if (focus >= FOCUS_MIN && stable) {
-      // Sharp & settled — read it once and freeze.
-      runStageB(top);
-      latched = top;
-      updateMatches(top);
-      uiState = "matched";
-    } else if (uiState !== "focusing") {
-      renderFocusing();
-      uiState = "focusing";
+    renderTrack(track);
+  }
+
+  function freshTrack(d) {
+    return {
+      box: { x: d.x, y: d.y, w: d.w, h: d.h },
+      templateId: d.templateId, templateConf: d.templateConf, borderId: d.borderId,
+      sig: {
+        name:         { v: "", agree: 0, lock: false },
+        collector_id: { v: "", agree: 0, lock: false },
+        set_text:     { v: "", agree: 0, lock: false },
+        set_symbol:   { id: -1, conf: 0, lock: false },
+      },
+    };
+  }
+
+  // Read each not-yet-locked region; lock it once its OWN crop is sharp and the
+  // read is trustworthy. Different signals can lock on different frames.
+  function accumulate(track) {
+    const tmpl = TEMPLATE_CROPS[TCG_NAMES[tcgId]]?.[track.templateId];
+    if (!tmpl) return;
+    for (const key of ["name", "collector_id", "set_text"]) {
+      const s = track.sig[key];
+      if (s.lock || !tmpl[key]) continue;
+      const r = readOcr(track.box, tmpl[key]);
+      if (!r || r.sharp < REGION_FOCUS_MIN || !r.text) continue;
+      if (r.text === s.v) {
+        if (++s.agree >= OCR_AGREE) s.lock = true;   // two sharp frames agree → lock
+      } else {
+        s.v = r.text; s.agree = 1;                   // adopt the newer/sharper read
+      }
+    }
+    const ss = track.sig.set_symbol;
+    if (!ss.lock && tmpl.set_symbol) {
+      const r = readSymbol(track.box, tmpl.set_symbol);
+      if (r && r.sharp >= REGION_FOCUS_MIN && r.conf > ss.conf) {
+        ss.id = r.id; ss.conf = r.conf;
+        if (r.conf >= SYMBOL_LOCK) ss.lock = true;
+      }
+    }
+    if ((++frameNo) % 30 === 0) {
+      const g = track.sig;
+      console.log(`[signals] name="${g.name.v}"${g.name.lock ? "🔒" : ""} `
+        + `id="${g.collector_id.v}"${g.collector_id.lock ? "🔒" : ""} `
+        + `set="${g.set_text.v}"${g.set_text.lock ? "🔒" : ""} `
+        + `sym=${g.set_symbol.id}@${g.set_symbol.conf.toFixed(2)}${g.set_symbol.lock ? "🔒" : ""}`);
     }
   }
 
-  // Variance-of-Laplacian on a tiny grayscale card crop. High == sharp.
-  function focusScore(d) {
-    const W = 160;
-    const aspect = d.h > 0 ? d.w / d.h : 0.72;
-    const H = Math.max(8, Math.round(W / aspect));
-    if (focusCanvas.width !== W || focusCanvas.height !== H) {
-      focusCanvas.width = W; focusCanvas.height = H;
+  // Re-render only when a displayed signal actually changes (keeps it static).
+  function renderTrack(track) {
+    const g = track.sig;
+    const key = `${track.templateId}|${g.name.v}|${g.collector_id.v}|${g.set_text.v}|${g.set_symbol.id}`;
+    if (key === lastRenderKey) return;
+    lastRenderKey = key;
+    if (!g.name.v && !g.collector_id.v && !g.set_text.v && g.set_symbol.id < 0) {
+      renderFocusing();
+      return;
     }
-    let sx = Math.max(0, Math.round(d.x)), sy = Math.max(0, Math.round(d.y));
-    let sw = Math.min(frameScratch.width - sx, Math.round(d.w));
-    let sh = Math.min(frameScratch.height - sy, Math.round(d.h));
-    if (sw < 8 || sh < 8) return 0;
-    const fctx = focusCanvas.getContext("2d", { willReadFrequently: true });
-    fctx.drawImage(frameScratch, sx, sy, sw, sh, 0, 0, W, H);
-    const px = fctx.getImageData(0, 0, W, H).data;
-    const gray = new Float32Array(W * H);
-    for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
-      gray[i] = 0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2];
+    updateMatches({
+      x: track.box.x, y: track.box.y, w: track.box.w, h: track.box.h,
+      templateId: track.templateId, templateConf: track.templateConf, borderId: track.borderId,
+      name: g.name.v, collectorId: g.collector_id.v, setText: g.set_text.v,
+      symbolId: g.set_symbol.id, symbolConf: g.set_symbol.conf,
+    });
+  }
+
+  // Variance-of-Laplacian over RGBA pixels — high == sharp, low == blurry.
+  function laplacianVar(data, w, h) {
+    const g = new Float32Array(w * h);
+    for (let i = 0, p = 0; i < g.length; i++, p += 4) {
+      g[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
     }
     let sum = 0, sum2 = 0, n = 0;
-    for (let y = 1; y < H - 1; y++) {
-      for (let x = 1; x < W - 1; x++) {
-        const i = y * W + x;
-        const lap = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - W] - gray[i + W];
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x;
+        const lap = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w];
         sum += lap; sum2 += lap * lap; n++;
       }
     }
@@ -220,20 +267,8 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
     if (panel) panel.innerHTML = `<div class="text-amber-400/80 text-sm">Hold steady — focusing…</div>`;
   }
 
-  function runStageB(d) {
-    d.name = ""; d.collectorId = ""; d.setText = "";
-    d.symbolId = -1; d.symbolConf = 0;
-    if (d.templateId < 0) return;
-    const tmpl = TEMPLATE_CROPS[TCG_NAMES[tcgId]]?.[d.templateId];
-    if (!tmpl) return;
-    if (tmpl.name)         d.name        = ocrRegion(d, tmpl.name);
-    if (tmpl.collector_id) d.collectorId = ocrRegion(d, tmpl.collector_id);
-    if (tmpl.set_text)     d.setText     = ocrRegion(d, tmpl.set_text);
-    if (tmpl.set_symbol)   symbolRegion(d, tmpl.set_symbol);
-  }
-
   // Crop a normalized-within-bbox region from the full-res frame into cropBuf.
-  // Returns [w, h] of the crop placed in cropBuf, or null if too small.
+  // Returns {w, h, sharp} for the crop placed in cropBuf, or null if too small.
   function cropRegionToBuf(d, rect) {
     let sx = Math.round(d.x + inset(rect[0]) * d.w);
     let sy = Math.round(d.y + inset(rect[1]) * d.h);
@@ -258,23 +293,24 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
     rctx.drawImage(frameScratch, sx, sy, sw, sh, 0, 0, dw, dh);
     const img = rctx.getImageData(0, 0, dw, dh);
     HEAPU8.set(img.data, cropBuf);
-    return [dw, dh];
+    return { w: dw, h: dh, sharp: laplacianVar(img.data, dw, dh) };
   }
 
-  function ocrRegion(d, rect) {
-    const dims = cropRegionToBuf(d, rect);
-    if (!dims) return "";
-    _ocr_region(cropBuf, dims[0], dims[1], ocrBuf, 64);
-    return decodeCStr(HEAPU8, ocrBuf, 64);
+  // OCR one region from the full-res frame. Returns {text, sharp} or null.
+  function readOcr(box, rect) {
+    const c = cropRegionToBuf(box, rect);
+    if (!c) return null;
+    _ocr_region(cropBuf, c.w, c.h, ocrBuf, 64);
+    return { text: decodeCStr(HEAPU8, ocrBuf, 64), sharp: c.sharp };
   }
 
-  function symbolRegion(d, rect) {
-    const dims = cropRegionToBuf(d, rect);
-    if (!dims) return;
-    _symbol_region(tcgId, cropBuf, dims[0], dims[1], symBuf);
+  // Symbol-classify one region. Returns {id, conf, sharp} or null.
+  function readSymbol(box, rect) {
+    const c = cropRegionToBuf(box, rect);
+    if (!c) return null;
+    _symbol_region(tcgId, cropBuf, c.w, c.h, symBuf);
     const dv = new DataView(HEAPU8.buffer, symBuf, 8);
-    d.symbolId = dv.getInt32(0, true);
-    d.symbolConf = dv.getFloat32(4, true);
+    return { id: dv.getInt32(0, true), conf: dv.getFloat32(4, true), sharp: c.sharp };
   }
 
   function decodeSlot(slotIndex) {

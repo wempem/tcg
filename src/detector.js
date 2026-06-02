@@ -66,10 +66,18 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   // latch the last good reading rather than re-OCR every blurry frame.
   const FOCUS_MIN = 55;     // variance-of-Laplacian threshold (tunable; logged)
   const STABLE_IOU = 0.9;   // bbox overlap vs previous frame == "not moving"
-  const LATCH_IOU = 0.5;    // overlap to keep showing the latched result
+  const LATCH_IOU = 0.5;    // overlap to treat a detection as the same card
   let lastBox = null;       // previous frame's bbox (full-res coords)
-  let latched = null;       // last detection that passed the gate (with Stage B)
+  let latched = null;       // currently displayed detection (frozen until card changes)
+  let uiState = "empty";    // 'empty' | 'focusing' | 'matched' — only redraw on change
   let frameNo = 0;
+
+  // The YOLO box runs a touch loose at the top when the card is far from the
+  // camera, which shifts top regions (the name) up while leaving bottom
+  // regions (the id) put. Bias each region's Y down by REGION_Y_BIAS*(1-ry):
+  // strong for the name (ry≈0.025), ~zero for the id (ry≈0.93). Tunable.
+  const REGION_Y_BIAS = 0.025;
+  const biasY = (ry) => ry + REGION_Y_BIAS * (1 - ry);
 
   function initMemory() {
     loBuf = _malloc(LO_EDGE * LO_EDGE * 4);
@@ -131,12 +139,19 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       if (!top || d.conf > top.conf) top = d;
     }
     if (!top) {
-      lastBox = null;
-      if (!latched) renderEmpty();   // keep the last match briefly if card just blurred out
+      lastBox = null; latched = null;
+      if (uiState !== "empty") { renderEmpty(); uiState = "empty"; }
       return;
     }
 
-    // ---- Sharpness + stability gate ----
+    // Already locked onto this same card? Keep the frozen result — no re-OCR,
+    // no re-render. This is what makes the panel static instead of flickering.
+    if (latched && iou(top, latched) >= LATCH_IOU) {
+      lastBox = { x: top.x, y: top.y, w: top.w, h: top.h };
+      return;
+    }
+
+    // New / not-yet-read card: gate Stage B on focus + stability.
     const focus = focusScore(top);
     const stable = lastBox ? iou(top, lastBox) >= STABLE_IOU : false;
     lastBox = { x: top.x, y: top.y, w: top.w, h: top.h };
@@ -145,17 +160,14 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
     }
 
     if (focus >= FOCUS_MIN && stable) {
-      // Sharp & settled — run Stage B and latch the result.
+      // Sharp & settled — read it once and freeze.
       runStageB(top);
       latched = top;
       updateMatches(top);
-    } else if (latched && iou(top, latched) >= LATCH_IOU) {
-      // Same card, just a soft/moving frame — hold the last good reading.
-      updateMatches(latched);
-    } else {
-      // A card is present but we have no trustworthy reading yet.
-      latched = null;
+      uiState = "matched";
+    } else if (uiState !== "focusing") {
       renderFocusing();
+      uiState = "focusing";
     }
   }
 
@@ -221,7 +233,7 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   // Returns [w, h] of the crop placed in cropBuf, or null if too small.
   function cropRegionToBuf(d, rect) {
     let sx = Math.round(d.x + rect[0] * d.w);
-    let sy = Math.round(d.y + rect[1] * d.h);
+    let sy = Math.round(d.y + biasY(rect[1]) * d.h);
     let sw = Math.round(rect[2] * d.w);
     let sh = Math.round(rect[3] * d.h);
     sx = Math.max(0, Math.min(frameScratch.width - 1, sx));
@@ -364,7 +376,7 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       if (!r) continue;
       const [rx, ry, rw, rh] = r;
       ctx.strokeStyle = info.color;
-      ctx.strokeRect(rx * targetW, ry * targetH, rw * targetW, rh * targetH);
+      ctx.strokeRect(rx * targetW, biasY(ry) * targetH, rw * targetW, rh * targetH);
     }
   }
 
@@ -404,7 +416,7 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       if (!r) continue;
       const [rx, ry, rw, rh] = r;
       const sx = d.x + rx * d.w;
-      const sy = d.y + ry * d.h;
+      const sy = d.y + biasY(ry) * d.h;
       const sw = rw * d.w;
       const sh = rh * d.h;
       const row = document.createElement("div");

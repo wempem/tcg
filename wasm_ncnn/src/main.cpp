@@ -483,6 +483,113 @@ void process_frame(uint8_t* rgba, int orig_w, int orig_h, int tcg_id,
     }
 }
 
+// ---- Two-stage pipeline -------------------------------------------------
+// Stage A runs YOLO + template + border on a small (downscaled) frame; the
+// browser then crops the name/id/symbol regions from the FULL-resolution
+// frame and calls the Stage-B helpers below on those small high-res crops.
+// This keeps OCR/symbol input sharp without ever copying a full-res frame
+// into the wasm heap every frame.
+
+// Stage A: detect + classify only. Same as process_frame minus OCR/symbol.
+void analyze_frame(uint8_t* rgba, int orig_w, int orig_h, int tcg_id,
+                   float conf_thresh, uint8_t* result_buf) {
+    memset(result_buf, 0, sizeof(Detection) * MAX_DETECTIONS);
+    Detection* slots = reinterpret_cast<Detection*>(result_buf);
+    for (int i = 0; i < MAX_DETECTIONS; i++) {
+        slots[i].template_id = -1;
+        slots[i].symbol_id = -1;
+        slots[i].border_id = -1;
+    }
+    if (!g_yolo_loaded) return;
+
+    ncnn::Mat input = ncnn::Mat::from_pixels_resize(
+        rgba, ncnn::Mat::PIXEL_RGBA2BGR, orig_w, orig_h, MODEL_W, MODEL_H);
+    input.substract_mean_normalize(0, YOLO_NORM);
+
+    ncnn::Extractor ex = g_yolo.create_extractor();
+    ex.set_light_mode(true);
+    ex.input("in0", input);
+    ncnn::Mat out;
+    ex.extract("out0", out);
+
+    std::vector<Box> dets;
+    decode_yolov8(out, conf_thresh, dets);
+    nms(dets, 0.45f);
+
+    float sx = (float)orig_w / (float)MODEL_W;
+    float sy = (float)orig_h / (float)MODEL_H;
+    int n = std::min((int)dets.size(), MAX_DETECTIONS);
+    for (int i = 0; i < n; i++) {
+        auto& b = dets[i].bbox;
+        int x = (int)(b.x * sx);
+        int y = (int)(b.y * sy);
+        int w = (int)(b.w * sx);
+        int h = (int)(b.h * sy);
+
+        slots[i].conf = dets[i].conf;
+        slots[i].bbox[0] = (float)x;
+        slots[i].bbox[1] = (float)y;
+        slots[i].bbox[2] = (float)w;
+        slots[i].bbox[3] = (float)h;
+
+        run_template(tcg_id, rgba, orig_w, orig_h, x, y, w, h, slots[i]);
+        slots[i].border_id = sample_border(rgba, orig_w, orig_h, x, y, w, h);
+    }
+}
+
+// Stage B: OCR a pre-cropped region. The whole rgba buffer IS the region
+// (already cropped at high resolution browser-side). Writes UTF-8 into dest.
+void ocr_region(uint8_t* rgba, int w, int h, char* dest, int dest_cap) {
+    if (dest_cap > 0) dest[0] = '\0';
+    if (!g_ocr_loaded || w < 4 || h < 4 || dest_cap < 2) return;
+
+    float aspect = (float)w / (float)h;
+    int target_w = (int)(OCR_H * aspect);
+    int max_w = target_w > OCR_W_NARROW ? OCR_W_WIDE : OCR_W_NARROW;
+    if (target_w > max_w) target_w = max_w;
+    if (target_w < 8) target_w = 8;
+
+    ncnn::Mat in = ncnn::Mat::from_pixels_resize(
+        rgba, ncnn::Mat::PIXEL_RGBA2RGB, w, h, target_w, OCR_H);
+    in.substract_mean_normalize(OCR_MEAN, OCR_NORM);
+
+    ncnn::Extractor ex = g_ocr.create_extractor();
+    ex.set_light_mode(true);
+    ex.input("in0", in);
+    ncnn::Mat out;
+    ex.extract("out0", out);
+
+    std::string text = ctc_decode(out);
+    std::strncpy(dest, text.c_str(), dest_cap - 1);
+    dest[dest_cap - 1] = '\0';
+}
+
+// Stage B: symbol-classify a pre-cropped region. out8 = [int32 id, float32 conf].
+void symbol_region(int tcg_id, uint8_t* rgba, int w, int h, uint8_t* out8) {
+    int32_t* id_out = reinterpret_cast<int32_t*>(out8);
+    float* conf_out = reinterpret_cast<float*>(out8 + 4);
+    *id_out = -1;
+    *conf_out = 0.f;
+    if (!ensure_symbol(tcg_id) || w < 4 || h < 4) return;
+
+    ncnn::Mat in = ncnn::Mat::from_pixels_resize(
+        rgba, ncnn::Mat::PIXEL_RGBA2RGB, w, h, SYMBOL_INPUT, SYMBOL_INPUT);
+    in.substract_mean_normalize(IMAGENET_MEAN, IMAGENET_NORM);
+
+    ncnn::Extractor ex = g_symbol[tcg_id].create_extractor();
+    ex.set_light_mode(true);
+    ex.input("in0", in);
+    ncnn::Mat out;
+    ex.extract("out0", out);
+
+    int arg = -1;
+    float prob = 0.f;
+    int nn = out.w * out.h * out.c;
+    if (nn > 0) softmax_argmax((const float*)out.data, nn, arg, prob);
+    *id_out = arg;
+    *conf_out = prob;
+}
+
 }  // extern "C"
 
 EMSCRIPTEN_BINDINGS(card_browser) {

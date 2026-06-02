@@ -42,14 +42,28 @@ const O_SET_TEXT = 136;       // 32 bytes
 const TEXT_DECODER = new TextDecoder();
 
 export function createDetector({ confidenceThreshold = 0.25 } = {}) {
-  let imageBuf;     // RGBA frame bytes pushed into WASM heap
+  let loBuf;        // small RGBA frame for Stage A (YOLO + template + border)
+  let cropBuf;      // one high-res region crop for Stage B (OCR / symbol)
+  let ocrBuf;       // OCR output C-string
+  let symBuf;       // symbol_region output: [int32 id, float32 conf]
   let resultBuf;    // 2048 bytes; struct Detection[8]
   let tcgId = 0;    // 0=mtg, 1=pokemon, 2=yugioh
 
+  // Stage A runs on a downscale (YOLO/template only need ~320). Stage B crops
+  // name/id/symbol regions from the FULL-res capture frame, so OCR/symbol see
+  // real detail. We never copy the full-res frame into the wasm heap — only
+  // the small low-res frame and the even smaller region crops cross the line.
+  const LO_EDGE = 512;             // Stage-A frame long edge
+  const CROP_MAX_PX = 1024 * 768;  // cap one region crop's pixel count
+  const loCanvas = document.createElement("canvas");
+  const regionCanvas = document.createElement("canvas");
+  const frameScratch = document.createElement("canvas");  // hosts the full-res frame
+
   function initMemory() {
-    // 640×640 RGBA = 1.6 MB. Larger than the YOLO model input (320×320) — C++
-    // resizes for YOLO but keeps the full 640 source for downstream crops.
-    imageBuf = _malloc(640 * 640 * 4);
+    loBuf = _malloc(LO_EDGE * LO_EDGE * 4);
+    cropBuf = _malloc(CROP_MAX_PX * 4);
+    ocrBuf = _malloc(64);
+    symBuf = _malloc(8);
     resultBuf = _malloc(RESULT_BUFFER_SIZE);
   }
 
@@ -68,22 +82,104 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   }
 
   // The most recent raw frame ImageData — captured pre-overlay so the
-  // locked snapshot shows the exact pixels the pipeline processed.
+  // locked snapshot shows the exact pixels the pipeline processed. This is now
+  // the FULL-resolution capture frame (Stage B crops + previews read from it).
   let lastFrame = null;
+
   function processFrame(ctx, canvas) {
-    lastFrame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    HEAPU8.set(lastFrame.data, imageBuf);
+    const HW = canvas.width, HH = canvas.height;
+    lastFrame = ctx.getImageData(0, 0, HW, HH);
+    // Host the full-res frame on a scratch canvas so we can crop sub-regions
+    // (the live canvas gets the overlay drawn on it below).
+    if (frameScratch.width !== HW || frameScratch.height !== HH) {
+      frameScratch.width = HW; frameScratch.height = HH;
+    }
+    frameScratch.getContext("2d", { willReadFrequently: true }).putImageData(lastFrame, 0, 0);
 
-    _process_frame(
-      imageBuf,
-      canvas.width,
-      canvas.height,
-      tcgId,
-      confidenceThreshold,
-      resultBuf,
-    );
+    // ---- Stage A: downscale -> YOLO + template + border ----
+    const k = Math.min(1, LO_EDGE / Math.max(HW, HH));
+    const lw = Math.max(1, Math.round(HW * k));
+    const lh = Math.max(1, Math.round(HH * k));
+    if (loCanvas.width !== lw || loCanvas.height !== lh) { loCanvas.width = lw; loCanvas.height = lh; }
+    const lctx = loCanvas.getContext("2d", { willReadFrequently: true });
+    lctx.drawImage(frameScratch, 0, 0, lw, lh);
+    const loFrame = lctx.getImageData(0, 0, lw, lh);
+    HEAPU8.set(loFrame.data, loBuf);
+    _analyze_frame(loBuf, lw, lh, tcgId, confidenceThreshold, resultBuf);
 
-    renderDetections(ctx);
+    // Decode slots (bbox in lo-res coords), scale to full-res, draw boxes,
+    // and pick the top detection for Stage B.
+    let top = null;
+    const inv = 1 / k;
+    for (let i = 0; i < MAX_DETECTIONS; i++) {
+      const d = decodeSlot(i);
+      if (!d) continue;
+      d.x *= inv; d.y *= inv; d.w *= inv; d.h *= inv;  // lo-res -> full-res
+      drawBox(ctx, d);
+      if (!top || d.conf > top.conf) top = d;
+    }
+    if (!top) { renderEmpty(); return; }
+
+    // ---- Stage B: crop full-res regions, run OCR + symbol ----
+    runStageB(top);
+    updateMatches(top);
+  }
+
+  function runStageB(d) {
+    d.name = ""; d.collectorId = ""; d.setText = "";
+    d.symbolId = -1; d.symbolConf = 0;
+    if (d.templateId < 0) return;
+    const tmpl = TEMPLATE_CROPS[TCG_NAMES[tcgId]]?.[d.templateId];
+    if (!tmpl) return;
+    if (tmpl.name)         d.name        = ocrRegion(d, tmpl.name);
+    if (tmpl.collector_id) d.collectorId = ocrRegion(d, tmpl.collector_id);
+    if (tmpl.set_text)     d.setText     = ocrRegion(d, tmpl.set_text);
+    if (tmpl.set_symbol)   symbolRegion(d, tmpl.set_symbol);
+  }
+
+  // Crop a normalized-within-bbox region from the full-res frame into cropBuf.
+  // Returns [w, h] of the crop placed in cropBuf, or null if too small.
+  function cropRegionToBuf(d, rect) {
+    let sx = Math.round(d.x + rect[0] * d.w);
+    let sy = Math.round(d.y + rect[1] * d.h);
+    let sw = Math.round(rect[2] * d.w);
+    let sh = Math.round(rect[3] * d.h);
+    sx = Math.max(0, Math.min(frameScratch.width - 1, sx));
+    sy = Math.max(0, Math.min(frameScratch.height - 1, sy));
+    sw = Math.min(frameScratch.width - sx, sw);
+    sh = Math.min(frameScratch.height - sy, sh);
+    if (sw < 4 || sh < 4) return null;
+    // Cap to the crop buffer, preserving aspect.
+    let dw = sw, dh = sh;
+    if (dw * dh > CROP_MAX_PX) {
+      const s = Math.sqrt(CROP_MAX_PX / (dw * dh));
+      dw = Math.max(4, Math.floor(dw * s));
+      dh = Math.max(4, Math.floor(dh * s));
+    }
+    if (regionCanvas.width !== dw || regionCanvas.height !== dh) {
+      regionCanvas.width = dw; regionCanvas.height = dh;
+    }
+    const rctx = regionCanvas.getContext("2d", { willReadFrequently: true });
+    rctx.drawImage(frameScratch, sx, sy, sw, sh, 0, 0, dw, dh);
+    const img = rctx.getImageData(0, 0, dw, dh);
+    HEAPU8.set(img.data, cropBuf);
+    return [dw, dh];
+  }
+
+  function ocrRegion(d, rect) {
+    const dims = cropRegionToBuf(d, rect);
+    if (!dims) return "";
+    _ocr_region(cropBuf, dims[0], dims[1], ocrBuf, 64);
+    return decodeCStr(HEAPU8, ocrBuf, 64);
+  }
+
+  function symbolRegion(d, rect) {
+    const dims = cropRegionToBuf(d, rect);
+    if (!dims) return;
+    _symbol_region(tcgId, cropBuf, dims[0], dims[1], symBuf);
+    const dv = new DataView(HEAPU8.buffer, symBuf, 8);
+    d.symbolId = dv.getInt32(0, true);
+    d.symbolConf = dv.getFloat32(4, true);
   }
 
   function decodeSlot(slotIndex) {
@@ -107,24 +203,6 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       collectorId: decodeCStr(slot, O_COLLECTOR_ID, 32),
       setText: decodeCStr(slot, O_SET_TEXT, 32),
     };
-  }
-
-  function renderDetections(ctx) {
-    let topDetection = null;
-    for (let i = 0; i < MAX_DETECTIONS; i++) {
-      const d = decodeSlot(i);
-      if (!d) continue;
-      drawBox(ctx, d);
-      if (!topDetection || d.conf > topDetection.conf) topDetection = d;
-    }
-    if (!topDetection) {
-      renderEmpty();
-      return;
-    }
-    // Surface the detection even when OCR is empty — this way you can see
-    // "card detected, template predicted, just OCR didn't read anything"
-    // rather than the silent "Hold a card…" state.
-    updateMatches(topDetection);
   }
 
   function renderEmpty() {

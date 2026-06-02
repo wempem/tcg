@@ -58,6 +58,18 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   const loCanvas = document.createElement("canvas");
   const regionCanvas = document.createElement("canvas");
   const frameScratch = document.createElement("canvas");  // hosts the full-res frame
+  const focusCanvas = document.createElement("canvas");   // tiny gray card crop for sharpness
+
+  // Sharpness + stability gate. OCR only reads cleanly on sharp, settled
+  // frames (the model nails sharp crops but emits garbage on motion blur),
+  // so we run Stage B only when the card is in focus AND not moving, and
+  // latch the last good reading rather than re-OCR every blurry frame.
+  const FOCUS_MIN = 55;     // variance-of-Laplacian threshold (tunable; logged)
+  const STABLE_IOU = 0.9;   // bbox overlap vs previous frame == "not moving"
+  const LATCH_IOU = 0.5;    // overlap to keep showing the latched result
+  let lastBox = null;       // previous frame's bbox (full-res coords)
+  let latched = null;       // last detection that passed the gate (with Stage B)
+  let frameNo = 0;
 
   function initMemory() {
     loBuf = _malloc(LO_EDGE * LO_EDGE * 4);
@@ -118,11 +130,79 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       drawBox(ctx, d);
       if (!top || d.conf > top.conf) top = d;
     }
-    if (!top) { renderEmpty(); return; }
+    if (!top) {
+      lastBox = null;
+      if (!latched) renderEmpty();   // keep the last match briefly if card just blurred out
+      return;
+    }
 
-    // ---- Stage B: crop full-res regions, run OCR + symbol ----
-    runStageB(top);
-    updateMatches(top);
+    // ---- Sharpness + stability gate ----
+    const focus = focusScore(top);
+    const stable = lastBox ? iou(top, lastBox) >= STABLE_IOU : false;
+    lastBox = { x: top.x, y: top.y, w: top.w, h: top.h };
+    if ((++frameNo) % 30 === 0) {
+      console.log(`[gate] focus=${focus.toFixed(0)} (min ${FOCUS_MIN}) stable=${stable}`);
+    }
+
+    if (focus >= FOCUS_MIN && stable) {
+      // Sharp & settled — run Stage B and latch the result.
+      runStageB(top);
+      latched = top;
+      updateMatches(top);
+    } else if (latched && iou(top, latched) >= LATCH_IOU) {
+      // Same card, just a soft/moving frame — hold the last good reading.
+      updateMatches(latched);
+    } else {
+      // A card is present but we have no trustworthy reading yet.
+      latched = null;
+      renderFocusing();
+    }
+  }
+
+  // Variance-of-Laplacian on a tiny grayscale card crop. High == sharp.
+  function focusScore(d) {
+    const W = 160;
+    const aspect = d.h > 0 ? d.w / d.h : 0.72;
+    const H = Math.max(8, Math.round(W / aspect));
+    if (focusCanvas.width !== W || focusCanvas.height !== H) {
+      focusCanvas.width = W; focusCanvas.height = H;
+    }
+    let sx = Math.max(0, Math.round(d.x)), sy = Math.max(0, Math.round(d.y));
+    let sw = Math.min(frameScratch.width - sx, Math.round(d.w));
+    let sh = Math.min(frameScratch.height - sy, Math.round(d.h));
+    if (sw < 8 || sh < 8) return 0;
+    const fctx = focusCanvas.getContext("2d", { willReadFrequently: true });
+    fctx.drawImage(frameScratch, sx, sy, sw, sh, 0, 0, W, H);
+    const px = fctx.getImageData(0, 0, W, H).data;
+    const gray = new Float32Array(W * H);
+    for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
+      gray[i] = 0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2];
+    }
+    let sum = 0, sum2 = 0, n = 0;
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const i = y * W + x;
+        const lap = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - W] - gray[i + W];
+        sum += lap; sum2 += lap * lap; n++;
+      }
+    }
+    if (n === 0) return 0;
+    const mean = sum / n;
+    return sum2 / n - mean * mean;
+  }
+
+  function iou(a, b) {
+    const ix0 = Math.max(a.x, b.x), iy0 = Math.max(a.y, b.y);
+    const ix1 = Math.min(a.x + a.w, b.x + b.w), iy1 = Math.min(a.y + a.h, b.y + b.h);
+    const iw = Math.max(0, ix1 - ix0), ih = Math.max(0, iy1 - iy0);
+    const inter = iw * ih;
+    const uni = a.w * a.h + b.w * b.h - inter;
+    return uni > 0 ? inter / uni : 0;
+  }
+
+  function renderFocusing() {
+    const panel = document.getElementById("matches");
+    if (panel) panel.innerHTML = `<div class="text-amber-400/80 text-sm">Hold steady — focusing…</div>`;
   }
 
   function runStageB(d) {

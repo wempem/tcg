@@ -24,6 +24,16 @@ export async function initCamera(onFrame) {
   video.srcObject = stream;
   await video.play();
 
+  // Best-effort: request continuous autofocus so handheld frames sharpen
+  // quickly (the OCR only fires on sharp frames via detector.js's gate).
+  try {
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities?.() || {};
+    if (caps.focusMode && caps.focusMode.includes("continuous")) {
+      await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+    }
+  } catch (_) { /* unsupported — ignore */ }
+
   // Size the capture canvas to the camera's native aspect, capped on the long
   // edge. Preserving aspect (vs the old 320×320 square) avoids distorting the
   // card before it ever reaches the models.

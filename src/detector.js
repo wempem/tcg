@@ -72,12 +72,15 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   let uiState = "empty";    // 'empty' | 'focusing' | 'matched' — only redraw on change
   let frameNo = 0;
 
-  // The YOLO box runs a touch loose at the top when the card is far from the
-  // camera, which shifts top regions (the name) up while leaving bottom
-  // regions (the id) put. Bias each region's Y down by REGION_Y_BIAS*(1-ry):
-  // strong for the name (ry≈0.025), ~zero for the id (ry≈0.93). Tunable.
-  const REGION_Y_BIAS = 0.025;
-  const biasY = (ry) => ry + REGION_Y_BIAS * (1 - ry);
+  // The YOLO box runs loose AROUND the card (margin on every side), not just
+  // at the top. Percent regions are calibrated against a tight box (card ==
+  // box), so against a loose box the top regions (name) ride high and the
+  // bottom regions (id/set_text) ride low while the middle stays put —
+  // error ~ INSET*(2*r - 1). Fix: treat the true card as the box inset by
+  // INSET per side and place the calibrated percentages inside it. inset()
+  // maps a normalized region coord into that inset box; used on BOTH axes.
+  const BBOX_INSET = 0.025;  // fractional margin per side (tunable)
+  const inset = (r) => BBOX_INSET + r * (1 - 2 * BBOX_INSET);
 
   function initMemory() {
     loBuf = _malloc(LO_EDGE * LO_EDGE * 4);
@@ -232,10 +235,10 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   // Crop a normalized-within-bbox region from the full-res frame into cropBuf.
   // Returns [w, h] of the crop placed in cropBuf, or null if too small.
   function cropRegionToBuf(d, rect) {
-    let sx = Math.round(d.x + rect[0] * d.w);
-    let sy = Math.round(d.y + biasY(rect[1]) * d.h);
-    let sw = Math.round(rect[2] * d.w);
-    let sh = Math.round(rect[3] * d.h);
+    let sx = Math.round(d.x + inset(rect[0]) * d.w);
+    let sy = Math.round(d.y + inset(rect[1]) * d.h);
+    let sw = Math.round(rect[2] * d.w * (1 - 2 * BBOX_INSET));
+    let sh = Math.round(rect[3] * d.h * (1 - 2 * BBOX_INSET));
     sx = Math.max(0, Math.min(frameScratch.width - 1, sx));
     sy = Math.max(0, Math.min(frameScratch.height - 1, sy));
     sw = Math.min(frameScratch.width - sx, sw);
@@ -375,8 +378,9 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       const r = tmpl[info.key];
       if (!r) continue;
       const [rx, ry, rw, rh] = r;
+      const sc = 1 - 2 * BBOX_INSET;
       ctx.strokeStyle = info.color;
-      ctx.strokeRect(rx * targetW, biasY(ry) * targetH, rw * targetW, rh * targetH);
+      ctx.strokeRect(inset(rx) * targetW, inset(ry) * targetH, rw * sc * targetW, rh * sc * targetH);
     }
   }
 
@@ -415,10 +419,11 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       const r = tmpl[info.key];
       if (!r) continue;
       const [rx, ry, rw, rh] = r;
-      const sx = d.x + rx * d.w;
-      const sy = d.y + biasY(ry) * d.h;
-      const sw = rw * d.w;
-      const sh = rh * d.h;
+      const sc = 1 - 2 * BBOX_INSET;
+      const sx = d.x + inset(rx) * d.w;
+      const sy = d.y + inset(ry) * d.h;
+      const sw = rw * sc * d.w;
+      const sh = rh * sc * d.h;
       const row = document.createElement("div");
       row.className = "flex items-center gap-3";
       const cv = document.createElement("canvas");

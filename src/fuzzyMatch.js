@@ -29,6 +29,7 @@ const TCG_WEIGHTS = {
     // hit (e.g. 0.45) still counts. Penalty stays gated at very high conf so a
     // confidently-wrong symbol barely hurts.
     symbol_bonus: 30, symbol_penalty: 3, symbol_penalty_conf: 0.95,
+    id_bonus: 25,  // id is a non-punishing tiebreaker (see scoring below)
     set_text_bonus: 12, set_text_penalty: 8,
     border_bonus: 15,
     family_bonus: 3,
@@ -70,8 +71,12 @@ export function fuzzyMatch({
   const nQuery = normalize(ocrName);
   let iQuery = normalize(ocrId);
   // MTG ID frequently leaks rarity letters / "Illus." fragments — extract
-  // the canonical "n" or "n/total" digit run.
+  // the canonical "n" or "n/total" digit run. Since the number is numeric,
+  // first map the classic OCR letter→digit confusions so near-misses match.
   if (tcg === "mtg" && iQuery) {
+    iQuery = iQuery
+      .replace(/o/g, "0").replace(/[li|]/g, "1").replace(/s/g, "5")
+      .replace(/b/g, "8").replace(/z/g, "2").replace(/g/g, "6");
     const m = iQuery.match(/(\d+)(?:\s*\/\s*(\d+))?/);
     if (m) iQuery = m[2] ? `${m[1]}/${m[2]}` : m[1];
   }
@@ -112,13 +117,20 @@ export function fuzzyMatch({
     const iScore = hasId && e._id ? wRatio(iQuery, e._id) : 0;
 
     let combined;
-    if (hasName && hasId && e._n && e._id) {
+    if (tcg !== "mtg" && hasName && hasId && e._n && e._id) {
+      // Pokemon/Yugioh keep the original name/id blend (yugioh's id is highly
+      // discriminative, e.g. LOB-EN001).
       const hi = Math.max(nScore, iScore), lo = Math.min(nScore, iScore);
       combined = w.name_hi * hi + w.name_lo * lo;
-    } else if (e._n && hasName) {
+    } else if (hasName && e._n) {
+      // MTG: name is the trustworthy primary; the id is tiny/low-contrast and
+      // frequently misread, so it only ADDS when it matches — it can't drag a
+      // confident name match below a wrong card. Among same-name printings it's
+      // a tiebreaker alongside the symbol.
       combined = nScore;
-    } else if (e._id && hasId) {
-      combined = iScore;
+      if (hasId && e._id) combined += (w.id_bonus || 0) * (iScore / 100);
+    } else if (hasId && e._id) {
+      combined = iScore;   // no name read → id carries it
     } else {
       combined = 0;
     }

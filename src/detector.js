@@ -272,7 +272,7 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
 
   // Crop a normalized-within-bbox region from the full-res frame into cropBuf.
   // Returns {w, h, sharp} for the crop placed in cropBuf, or null if too small.
-  function cropRegionToBuf(d, rect) {
+  function cropRegionToBuf(d, rect, enhance = false) {
     let sx = Math.round(d.x + insetX(rect[0]) * d.w);
     let sy = Math.round(d.y + insetY(rect[1]) * d.h);
     let sw = Math.round(rect[2] * d.w * scaleX);
@@ -295,13 +295,39 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
     const rctx = regionCanvas.getContext("2d", { willReadFrequently: true });
     rctx.drawImage(frameScratch, sx, sy, sw, sh, 0, 0, dw, dh);
     const img = rctx.getImageData(0, 0, dw, dh);
+    const sharp = laplacianVar(img.data, dw, dh);  // measure on RAW pixels
+    if (enhance) enhanceContrast(img.data);         // stretch only the OCR path
     HEAPU8.set(img.data, cropBuf);
-    return { w: dw, h: dh, sharp: laplacianVar(img.data, dw, dh) };
+    return { w: dw, h: dh, sharp };
+  }
+
+  // Percentile contrast stretch — lifts faint small text (collector_id) out of
+  // a low-contrast background before OCR. Clips 2%/98% of the luminance
+  // histogram and linearly rescales each channel by the same gain (preserves
+  // hue). Skipped when the crop is already high-contrast.
+  function enhanceContrast(data) {
+    const hist = new Uint32Array(256);
+    for (let p = 0; p < data.length; p += 4) {
+      hist[(0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]) | 0]++;
+    }
+    const n = data.length / 4;
+    const clip = Math.max(1, Math.floor(n * 0.02));
+    let lo = 0, hi = 255, acc = 0;
+    for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc > clip) { lo = i; break; } }
+    acc = 0;
+    for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc > clip) { hi = i; break; } }
+    if (hi - lo < 16) return;  // already spread / too flat — leave it alone
+    const gain = 255 / (hi - lo);
+    for (let p = 0; p < data.length; p += 4) {
+      data[p]     = Math.min(255, Math.max(0, (data[p]     - lo) * gain));
+      data[p + 1] = Math.min(255, Math.max(0, (data[p + 1] - lo) * gain));
+      data[p + 2] = Math.min(255, Math.max(0, (data[p + 2] - lo) * gain));
+    }
   }
 
   // OCR one region from the full-res frame. Returns {text, sharp} or null.
   function readOcr(box, rect) {
-    const c = cropRegionToBuf(box, rect);
+    const c = cropRegionToBuf(box, rect, true);  // contrast-stretch for OCR
     if (!c) return null;
     _ocr_region(cropBuf, c.w, c.h, ocrBuf, 64);
     return { text: decodeCStr(HEAPU8, ocrBuf, 64), sharp: c.sharp };

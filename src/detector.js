@@ -74,15 +74,18 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   let lastRenderKey = "";       // dedupe panel re-renders (keeps the UI static)
   let frameNo = 0;
 
-  // The YOLO box runs loose AROUND the card (margin on every side), not just
-  // at the top. Percent regions are calibrated against a tight box (card ==
-  // box), so against a loose box the top regions (name) ride high and the
-  // bottom regions (id/set_text) ride low while the middle stays put —
-  // error ~ INSET*(2*r - 1). Fix: treat the true card as the box inset by
-  // INSET per side and place the calibrated percentages inside it. inset()
-  // maps a normalized region coord into that inset box; used on BOTH axes.
-  const BBOX_INSET = 0.025;  // fractional margin per side (tunable)
-  const inset = (r) => BBOX_INSET + r * (1 - 2 * BBOX_INSET);
+  // The YOLO box runs loose around the card, and the slack is NOT symmetric
+  // (typically more at the top than the bottom), so a single margin that pulls
+  // the name down also over-lifts the id. Use a separate margin per edge and
+  // map the calibrated percent regions into that inset box. Still a GLOBAL
+  // geometric correction (looseness is bbox geometry, not template-specific);
+  // per-template residue is better killed by a corner-warp than by 26 tweaks.
+  const INSET_TOP = 0.025, INSET_BOTTOM = 0.010;   // fractions of bbox HEIGHT (tunable)
+  const INSET_LEFT = 0.020, INSET_RIGHT = 0.020;   // fractions of bbox WIDTH  (tunable)
+  const scaleX = 1 - INSET_LEFT - INSET_RIGHT;
+  const scaleY = 1 - INSET_TOP - INSET_BOTTOM;
+  const insetX = (rx) => INSET_LEFT + rx * scaleX;
+  const insetY = (ry) => INSET_TOP + ry * scaleY;
 
   function initMemory() {
     loBuf = _malloc(LO_EDGE * LO_EDGE * 4);
@@ -270,10 +273,10 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   // Crop a normalized-within-bbox region from the full-res frame into cropBuf.
   // Returns {w, h, sharp} for the crop placed in cropBuf, or null if too small.
   function cropRegionToBuf(d, rect) {
-    let sx = Math.round(d.x + inset(rect[0]) * d.w);
-    let sy = Math.round(d.y + inset(rect[1]) * d.h);
-    let sw = Math.round(rect[2] * d.w * (1 - 2 * BBOX_INSET));
-    let sh = Math.round(rect[3] * d.h * (1 - 2 * BBOX_INSET));
+    let sx = Math.round(d.x + insetX(rect[0]) * d.w);
+    let sy = Math.round(d.y + insetY(rect[1]) * d.h);
+    let sw = Math.round(rect[2] * d.w * scaleX);
+    let sh = Math.round(rect[3] * d.h * scaleY);
     sx = Math.max(0, Math.min(frameScratch.width - 1, sx));
     sy = Math.max(0, Math.min(frameScratch.height - 1, sy));
     sw = Math.min(frameScratch.width - sx, sw);
@@ -414,9 +417,8 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       const r = tmpl[info.key];
       if (!r) continue;
       const [rx, ry, rw, rh] = r;
-      const sc = 1 - 2 * BBOX_INSET;
       ctx.strokeStyle = info.color;
-      ctx.strokeRect(inset(rx) * targetW, inset(ry) * targetH, rw * sc * targetW, rh * sc * targetH);
+      ctx.strokeRect(insetX(rx) * targetW, insetY(ry) * targetH, rw * scaleX * targetW, rh * scaleY * targetH);
     }
   }
 
@@ -455,11 +457,10 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
       const r = tmpl[info.key];
       if (!r) continue;
       const [rx, ry, rw, rh] = r;
-      const sc = 1 - 2 * BBOX_INSET;
-      const sx = d.x + inset(rx) * d.w;
-      const sy = d.y + inset(ry) * d.h;
-      const sw = rw * sc * d.w;
-      const sh = rh * sc * d.h;
+      const sx = d.x + insetX(rx) * d.w;
+      const sy = d.y + insetY(ry) * d.h;
+      const sw = rw * scaleX * d.w;
+      const sh = rh * scaleY * d.h;
       const row = document.createElement("div");
       row.className = "flex items-center gap-3";
       const cv = document.createElement("canvas");

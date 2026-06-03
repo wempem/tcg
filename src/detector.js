@@ -87,6 +87,12 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
   const insetX = (rx) => INSET_LEFT + rx * scaleX;
   const insetY = (ry) => INSET_TOP + ry * scaleY;
 
+  // Vertical margin added to the SYMBOL crop only (must match symbol_classifier
+  // training: data.py _crop_pct ctx). The symbol classifier is trained on a
+  // vertically-margined, position-jittered crop so it tolerates bbox
+  // misalignment; deployment must crop the same margined region.
+  const SYMBOL_CTX_Y = 0.6;
+
   function initMemory() {
     loBuf = _malloc(LO_EDGE * LO_EDGE * 4);
     cropBuf = _malloc(CROP_MAX_PX * 4);
@@ -272,11 +278,16 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
 
   // Crop a normalized-within-bbox region from the full-res frame into cropBuf.
   // Returns {w, h, sharp} for the crop placed in cropBuf, or null if too small.
-  function cropRegionToBuf(d, rect, enhance = false) {
-    let sx = Math.round(d.x + insetX(rect[0]) * d.w);
-    let sy = Math.round(d.y + insetY(rect[1]) * d.h);
-    let sw = Math.round(rect[2] * d.w * scaleX);
-    let sh = Math.round(rect[3] * d.h * scaleY);
+  function cropRegionToBuf(d, rect, enhance = false, ctxY = 0) {
+    let [rx, ry, rw, rh] = rect;
+    if (ctxY > 0) {  // symbol: add vertical (and lighter horizontal) margin
+      const ey = ctxY * rh, ex = ctxY * 0.4 * rw;
+      rx -= ex; ry -= ey; rw += 2 * ex; rh += 2 * ey;
+    }
+    let sx = Math.round(d.x + insetX(rx) * d.w);
+    let sy = Math.round(d.y + insetY(ry) * d.h);
+    let sw = Math.round(rw * d.w * scaleX);
+    let sh = Math.round(rh * d.h * scaleY);
     sx = Math.max(0, Math.min(frameScratch.width - 1, sx));
     sy = Math.max(0, Math.min(frameScratch.height - 1, sy));
     sw = Math.min(frameScratch.width - sx, sw);
@@ -333,9 +344,11 @@ export function createDetector({ confidenceThreshold = 0.25 } = {}) {
     return { text: decodeCStr(HEAPU8, ocrBuf, 64), sharp: c.sharp };
   }
 
-  // Symbol-classify one region. Returns {id, conf, sharp} or null.
+  // Symbol-classify one region. Returns {id, conf, sharp} or null. The model is
+  // trained with vertical margin + positional jitter (symbol_classifier), so it
+  // tolerates the bbox misalignment without deployment-side offset scanning.
   function readSymbol(box, rect) {
-    const c = cropRegionToBuf(box, rect);
+    const c = cropRegionToBuf(box, rect, false, SYMBOL_CTX_Y);
     if (!c) return null;
     _symbol_region(tcgId, cropBuf, c.w, c.h, symBuf);
     const dv = new DataView(HEAPU8.buffer, symBuf, 8);
